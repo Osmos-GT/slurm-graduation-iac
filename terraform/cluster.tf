@@ -73,8 +73,8 @@ resource "yandex_kubernetes_node_group" "this" {
     
     # Add your ssh public key in case you want to connect to the node via ssh for debug.
     # The key have to be specified in the special format https://cloud.yandex.ru/docs/managed-kubernetes/operations/node-connect-ssh
-    # metadata = {
-    #   ssh-keys:"osmos:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFE6BeJjX7DQtNnIFmsJKfqtLf/RqNy7rzbjx2UWvwjL osmos"
-    # }
+    metadata = {
+      ssh-keys:"osmos:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFE6BeJjX7DQtNnIFmsJKfqtLf/RqNy7rzbjx2UWvwjL osmos"
+    }
   }
 }
