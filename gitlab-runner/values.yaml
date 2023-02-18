@@ -48,7 +48,7 @@ imagePullPolicy: IfNotPresent
 ## The GitLab Server URL (with protocol) that want to register the runner against
 ## ref: https://docs.gitlab.com/runner/commands/index.html#gitlab-runner-register
 ##
-gitlabUrl: https://yelb-repo.gitlab.yandexcloud.net/
+gitlabUrl: https://yelbgit.gitlab.yandexcloud.net/
 
 ## The Registration Token for adding new Runners to the GitLab Server. This must
 ## be retrieved from your GitLab Instance.
