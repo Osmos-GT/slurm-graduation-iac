@@ -1,0 +1,205 @@
+stages:
+  - lint
+  - build
+  - terraform-deploy
+  - terraform-destroy-all
+  - ingress-install
+  - certmanager-install
+  - gitlab-runner-install
+  - redis-install
+  - db-prepare
+
+image:
+  name: "$CI_TEMPLATE_REGISTRY_HOST/gitlab-org/terraform-images/releases/1.1:v0.43.0"
+
+variables:
+  TF_ROOT: terraform/      # The relative path to the root directory of the Terraform project
+  TF_STATE_NAME: default   # The name of the state file used by the GitLab Managed Terraform state backend
+
+cache:
+  key: "${TF_ROOT}"
+  paths:
+    - ${TF_ROOT}/.terraform/
+
+# Terraform mirror hack and yc utility setup.#
+before_script:
+  - |-
+    cat <<EOF > ~/.terraformrc
+    provider_installation {
+      network_mirror {
+        url = "https://terraform-mirror.yandexcloud.net/"
+        include = ["registry.terraform.io/*/*"]
+      }
+      direct {
+        exclude = ["registry.terraform.io/*/*"]
+      }
+    }
+    EOF
+  - apk add bash curl
+  - curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash
+  - export PATH="/root/yandex-cloud/bin:$PATH"
+  - yc config profile create sa-profile
+  - yc config set service-account-key $SA_KEY
+  - yc config set cloud-id $TF_VAR_YC_CLOUD_ID
+  - yc config set folder-id $TF_VAR_YC_FOLDER_ID
+  - export TF_VAR_YC_TOKEN=$(yc iam create-token)
+
+# Yamllint does not work well with helm templates therefore we exclude dir with them. They are checked by helm lint anyway.
+# https://github.com/sbaudoin/sonar-yaml/issues/46
+# Default line length of 80 is too short for gitlab-ci file.
+lint-yaml:
+  stage: lint
+  image:
+    name: cytopia/yamllint
+    entrypoint: ["/bin/ash", "-c"]
+  before_script:
+    - ''
+  script:
+    - 'yamllint -f colored . -d "{extends: relaxed, ignore: helm/templates, ignore: gitlab-runner/templates, rules: {line-length: {max: 210}}}"'
+
+terraform-validate:
+  stage: lint
+  script:
+    - cd "${TF_ROOT}"
+    - gitlab-terraform validate
+
+terraform-build:
+  stage: build
+  needs:
+    - lint-yaml
+    - terraform-validate
+  script:
+    - cd "${TF_ROOT}"
+    - gitlab-terraform plan -var="db_user=$YELB_DB_USER" -var="db_passw=$YELB_DB_PASS"
+    - gitlab-terraform plan-json
+  resource_group: ${TF_STATE_NAME}
+  artifacts:
+    reports:
+      terraform: ${TF_ROOT}/plan.json
+    paths:
+      - ${TF_ROOT}/plan.cache
+
+terraform-deploy:
+  stage: terraform-deploy
+  needs:
+    - terraform-build
+  script:
+    - cd "${TF_ROOT}"
+    - gitlab-terraform apply
+    - echo "LB_IP=$(gitlab-terraform output -raw lb-ip)"                 >> /builds/$CI_PROJECT_NAMESPACE/$CI_PROJECT_NAME/build.env
+    - curl -sS --request POST --header "PRIVATE-TOKEN:$GITLAB_PRIVATE_TOKEN" "https://yelb-repo.gitlab.yandexcloud.net/api/v4/groups/yelb/variables"
+      --form "key=YELB_DB_ADDR" --form "value=c-$(gitlab-terraform output -raw db-cluster-id).rw.mdb.yandexcloud.net" # create Gitlab var with db address
+  artifacts:
+    reports:
+      dotenv: build.env
+  resource_group: ${TF_STATE_NAME}
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+destroy:
+  stage: terraform-destroy-all
+  tags:
+    - local-k8s
+  script:
+    - apk add curl
+    - cd "${TF_ROOT}"
+    - gitlab-terraform destroy -var="db_user=$YELB_DB_USER" -var="db_passw=$YELB_DB_PASS"
+    - curl --request DELETE --header "PRIVATE-TOKEN:$GITLAB_PRIVATE_TOKEN"
+      "https://yelb-repo.gitlab.yandexcloud.net/api/v4/groups/yelb/variables/YELB_DB_ADDR" # delete Gitlab var with db address
+  resource_group: ${TF_STATE_NAME}
+  when: manual
+
+# Ingress will use the IP reserved in terraform-deploy job.#
+ingress:
+  stage: ingress-install
+  dependencies:
+    - terraform-deploy
+  image: alpine/helm:3.10.2
+  script:
+    - yc managed-kubernetes cluster get-credentials k8s-cluster --external --force
+    - helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+    - helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx
+      --set controller.service.loadBalancerIP=$LB_IP
+      --namespace ingress-nginx
+      --create-namespace
+      --version 4.4.2
+      --timeout 300s
+      --atomic
+      --debug
+      --wait
+  when: manual
+
+certmanager:
+  stage: certmanager-install
+  dependencies:
+    - terraform-deploy
+  image: alpine/k8s:1.23.16
+  script:
+    - yc managed-kubernetes cluster get-credentials k8s-cluster --external --force
+    - helm repo add jetstack https://charts.jetstack.io
+    - helm install cert-manager jetstack/cert-manager
+      --namespace cert-manager
+      --create-namespace
+      --version v1.11.0
+      --set installCRDs=true
+      --timeout 300s
+      --atomic
+      --debug
+      --wait
+    - kubectl apply -f acme-issuer.yaml # cluster issuer manifest
+  when: manual
+
+gitlab-runner:
+  stage: gitlab-runner-install
+  dependencies:
+    - terraform-deploy
+  image: alpine/helm:3.10.2
+  script:
+    - yc managed-kubernetes cluster get-credentials k8s-cluster --external --force
+    - apk add jq
+    - GITLAB_RUNNER_TOKEN=$(curl -s --header "PRIVATE-TOKEN:$GITLAB_PRIVATE_TOKEN" "https://yelb-repo.gitlab.yandexcloud.net/api/v4/groups/yelb" | jq -r '.runners_token')
+    - helm upgrade --install gitlab-runner gitlab-runner/
+      --set runnerRegistrationToken=$GITLAB_RUNNER_TOKEN
+      --namespace gitlab-runner
+      --create-namespace
+      --timeout 300s
+      --atomic
+      --debug
+      --wait
+  when: manual
+
+redis:
+  stage: redis-install
+  dependencies:
+    - terraform-deploy
+  image: alpine/helm:3.10.2
+  script:
+    - yc managed-kubernetes cluster get-credentials k8s-cluster --external --force
+    - helm repo add bitnami https://charts.bitnami.com/bitnami
+    - helm install -n redis redis bitnami/redis
+      --set auth.enabled=false
+      --version 17.7.3
+      --namespace redis
+      --create-namespace
+      --timeout 300s
+      --atomic
+      --debug
+      --wait
+  when: manual
+
+db-prepare:
+  stage: db-prepare
+  image: governmentpaas/psql:b40333a408f9f5c4642ec85c953dddbe9e94dfca
+  tags:
+    - cloud-k8s # DB has no public IP for security reasons, so this job should be run by runner inside k8s cluster created by terraform-build job.
+  before_script:
+    - ''
+  dependencies:
+    - terraform-deploy
+  script:
+    - chmod +x init-yelb-db.sh
+    - sh init-yelb-db.sh
+  when: manual
+
+###
