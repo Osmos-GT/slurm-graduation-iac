@@ -8,7 +8,7 @@
 
 Более подробно выбранные решения описаны в [отчете о проделанной работе](https://github.com/Osmos-GT/slurm-graduation-app/blob/main/report.md), загруженном в [App-репозитории](https://github.com/Osmos-GT/slurm-graduation-app).
 
-Пайплайн этого репозитория состоит из следующих этапов:
+## Этапы пайплайна
 
 ### Lint
 Terraform validate. Также согласно ТЗ предусмотрен yamllint, который выполняется параллельно.
